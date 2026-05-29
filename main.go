@@ -166,7 +166,7 @@ func defaultSystemResolver() (string, error) {
 
 func (f *Forwarder) handleRequest(w dns.ResponseWriter, r *dns.Msg) {
 	req := r.Copy()
-	f.applyDomainRemap(req)
+	mappedResult := f.applyDomainRemap(req)
 
 	resp, _, err := f.udpClient.Exchange(req, f.upstream)
 	if err == nil && resp != nil && resp.Truncated {
@@ -180,21 +180,77 @@ func (f *Forwarder) handleRequest(w dns.ResponseWriter, r *dns.Msg) {
 		return
 	}
 
+	f.remapDomainAnswers(resp, mappedResult)
 	resp.Id = r.Id
 	_ = w.WriteMsg(resp)
 }
 
-func (f *Forwarder) applyDomainRemap(req *dns.Msg) {
+func (f *Forwarder) remapDomainAnswers(resp *dns.Msg, mapping map[string]string) {
+	remapName := func(name string) string {
+		if og, ok := mapping[name]; ok {
+			return og
+		}
+		return name
+	}
+
+	// Question section — use index to actually modify the slice element
+	for i := range resp.Question {
+		if og, ok := mapping[resp.Question[i].Name]; ok {
+			resp.Question[i].Name = og
+		}
+	}
+
+	// Remap an individual RR: restore header Name + known RDATA domain fields
+	remapRR := func(rr dns.RR) {
+		hdr := rr.Header()
+		if og, ok := mapping[hdr.Name]; ok {
+			hdr.Name = og
+		}
+		switch v := rr.(type) {
+		case *dns.CNAME:
+			v.Target = remapName(v.Target)
+		case *dns.DNAME:
+			v.Target = remapName(v.Target)
+		case *dns.NS:
+			v.Ns = remapName(v.Ns)
+		case *dns.MX:
+			v.Mx = remapName(v.Mx)
+		case *dns.SRV:
+			v.Target = remapName(v.Target)
+		case *dns.PTR:
+			v.Ptr = remapName(v.Ptr)
+		case *dns.NAPTR:
+			v.Replacement = remapName(v.Replacement)
+		}
+	}
+
+	for _, rr := range resp.Answer {
+		remapRR(rr)
+	}
+	for _, rr := range resp.Ns {
+		remapRR(rr)
+	}
+	for _, rr := range resp.Extra {
+		remapRR(rr)
+	}
+}
+
+// return a mapping of mapped to original domain
+func (f *Forwarder) applyDomainRemap(req *dns.Msg) map[string]string {
+	theMap := make(map[string]string)
 	for i := range req.Question {
 		name := dns.Fqdn(req.Question[i].Name)
 		if mapped, ok := f.domainRemap[name]; ok {
+			theMap[dns.Fqdn(mapped)] = name
 			req.Question[i].Name = dns.Fqdn(mapped)
 			continue
 		}
 		if mapped, ok := remapHomelabName(name, homelabZone); ok {
+			theMap[mapped] = name
 			req.Question[i].Name = mapped
 		}
 	}
+	return theMap
 }
 
 func remapHomelabName(name, homelabZone string) (string, bool) {
