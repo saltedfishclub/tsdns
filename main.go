@@ -17,7 +17,6 @@ import (
 
 type Forwarder struct {
 	upstream    string
-	homelabZone string
 	domainRemap map[string]string
 	udpClient   dns.Client
 	tcpClient   dns.Client
@@ -87,8 +86,7 @@ func main() {
 	}
 
 	forwarder := &Forwarder{
-		upstream:    upstream,
-		homelabZone: zone,
+		upstream: upstream,
 		// Placeholder for future domain remapping rules.
 		domainRemap: map[string]string{},
 		udpClient:   dns.Client{Net: "udp"},
@@ -190,7 +188,7 @@ func (f *Forwarder) applyDomainRemap(req *dns.Msg) {
 			req.Question[i].Name = dns.Fqdn(mapped)
 			continue
 		}
-		if mapped, ok := remapHomelabName(name, f.homelabZone); ok {
+		if mapped, ok := remapHomelabName(name, homelabZone); ok {
 			req.Question[i].Name = mapped
 		}
 	}
