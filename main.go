@@ -196,13 +196,14 @@ func (f *Forwarder) applyDomainRemap(req *dns.Msg) {
 
 func remapHomelabName(name, homelabZone string) (string, bool) {
 	labels := dns.SplitDomainName(name)
-	if len(labels) != 4 {
+	_len := len(labels)
+	if _len < 4 {
 		return "", false
 	}
 	service := labels[0]
 	project := labels[1]
-	zone := labels[2]
-	tld := labels[3]
+	zone := labels[_len-2]
+	tld := labels[_len-1]
 	if zone != homelabZone || tld != localTLD {
 		return "", false
 	}
