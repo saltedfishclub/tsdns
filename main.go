@@ -35,6 +35,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("invalid TS_VERBOSE value: %v", err)
 	}
+	if len(localTLD) == 0 || localTLD[0] != '.' {
+		localTLD = "." + localTLD
+	}
 
 	ctx := context.Background()
 	zone := strings.Trim(strings.ToLower(homelabZone), ".")
@@ -195,16 +198,23 @@ func (f *Forwarder) applyDomainRemap(req *dns.Msg) {
 }
 
 func remapHomelabName(name, homelabZone string) (string, bool) {
-	labels := dns.SplitDomainName(name)
-	_len := len(labels)
-	if _len < 4 {
+	indexOfTLD := strings.LastIndex(name, localTLD)
+	if indexOfTLD < 0 {
 		return "", false
 	}
+	labels := dns.SplitDomainName(name[:indexOfTLD])
+	if len(labels) < 3 {
+		return "", false
+	}
+	_len := len(labels)
+	if _len < 3 {
+		return "", false
+	}
+	labels = labels[_len-3 : _len]
 	service := labels[0]
 	project := labels[1]
-	zone := labels[_len-2]
-	tld := labels[_len-1]
-	if zone != homelabZone || tld != localTLD {
+	zone := labels[2]
+	if zone != homelabZone {
 		return "", false
 	}
 	if service == "" || project == "" {
