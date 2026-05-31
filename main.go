@@ -25,6 +25,7 @@ type Forwarder struct {
 var (
 	tsHostname     = envOrDefault("TS_HOSTNAME", "tsdns")
 	tsStateDir     = envOrDefault("TS_STATE_DIR", "")
+	tsPreferPort   = envOrDefault("TS_PREFER_PORT", "")
 	homelabZone    = envOrDefault("HOMELAB_ZONE", "homelab")
 	localTLD       = envOrDefault("HOMELAB_TLD", "local")
 	advertiseRoute = envOrDefault("ADVERTISE_ROUTE", "")
@@ -49,6 +50,9 @@ func main() {
 		Hostname: tsHostname,
 		Dir:      tsStateDir,
 	}
+	if preferPort, err := strconv.Atoi(tsPreferPort); err == nil {
+		ts.Port = uint16(preferPort)
+	}
 
 	if tsnetVerbose {
 		ts.Logf = log.New(os.Stderr, fmt.Sprintf("[tsnet:%s] ", tsHostname), log.LstdFlags).Printf
@@ -56,7 +60,6 @@ func main() {
 	defer func() {
 		_ = ts.Close()
 	}()
-
 	if _, err := ts.Up(ctx); err != nil {
 		log.Fatalf("tailscale bring-up failed: %v", err)
 	}
