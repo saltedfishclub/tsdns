@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 	"unsafe"
 
 	"github.com/miekg/dns"
@@ -103,7 +104,7 @@ func main() {
 			}
 			ns.GetUDPHandlerForFlow = func(src, dst netip.AddrPort) (func(nettype.ConnPacketConn), bool) {
 				if prefix.Contains(dst.Addr()) {
-					return nil, false // 放行到 forwardUDP
+					return forwardUserNetstackUDP(src, dst), true
 				}
 				return oldUDP(src, dst)
 			}
@@ -156,6 +157,75 @@ func main() {
 	_ = udpServer.Shutdown()
 	_ = tcpServer.Shutdown()
 
+}
+
+// this is to replace the internal implementation of tsnet which does not set deadline for udp sockets, causing program block.
+func forwardUserNetstackUDP(src, dst netip.AddrPort) func(conn nettype.ConnPacketConn) {
+	return func(c nettype.ConnPacketConn) {
+		defer c.Close()
+		backend, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(dst))
+		if err != nil {
+			log.Printf("udp: dial %v: %v", dst, err)
+			return
+		}
+		defer backend.Close()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		const (
+			readDeadline = 5 * time.Second
+			idleTimeout  = 30 * time.Second
+		)
+		buf := make([]byte, 65536)
+
+		// tailnet → Docker（读 gVisor, 写 kernel socket）
+		go func() {
+			defer cancel()
+			for {
+				c.SetReadDeadline(time.Now().Add(readDeadline))
+				n, _, err := c.ReadFrom(buf)
+				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					if ne, ok := err.(net.Error); ok && ne.Timeout() {
+						continue
+					}
+					return
+				}
+				if _, err := backend.Write(buf[:n]); err != nil {
+					return
+				}
+			}
+		}()
+
+		// Docker → tailnet（读 kernel socket, 写 gVisor）
+		go func() {
+			defer cancel()
+			for {
+				backend.SetReadDeadline(time.Now().Add(readDeadline))
+				n, _, err := backend.ReadFromUDP(buf)
+				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					if ne, ok := err.(net.Error); ok && ne.Timeout() {
+						continue
+					}
+					return
+				}
+				if _, err := c.WriteTo(buf[:n], net.UDPAddrFromAddrPort(src)); err != nil {
+					return
+				}
+			}
+		}()
+
+		select {
+		case <-ctx.Done():
+		case <-time.After(idleTimeout):
+		}
+	}
 }
 
 // getNetstack 通过 unsafe 反射从 tsnet.Server 读取私有字段 netstack。
