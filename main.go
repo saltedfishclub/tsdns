@@ -7,12 +7,16 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
+	"unsafe"
 
 	"github.com/miekg/dns"
 	"tailscale.com/ipn"
 	"tailscale.com/tsnet"
+	"tailscale.com/types/nettype"
+	"tailscale.com/wgengine/netstack"
 )
 
 type Forwarder struct {
@@ -84,6 +88,27 @@ func main() {
 			log.Fatalf("failed to advertise route %s: %v", prefix, err)
 		}
 		log.Printf("advertised route prefix to tailnet: %s", prefix)
+		if _, err := os.Stat("/dev/net/tun"); err != nil {
+			log.Println("Cannot find /dev/net/tun, downgrading to unprivileged L4 forwarding mode.")
+			// 通过反射替换 gVisor netstack 的 TCP/UDP handler，
+			// 让发往广播子网的流量走内置 forwardTCP/forwardUDP（无需特权）
+			ns := getNetstack(ts)
+			oldTCP := ns.GetTCPHandlerForFlow
+			oldUDP := ns.GetUDPHandlerForFlow
+			ns.GetTCPHandlerForFlow = func(src, dst netip.AddrPort) (func(net.Conn), bool) {
+				if prefix.Contains(dst.Addr()) {
+					return nil, false // 放行到 forwardTCP
+				}
+				return oldTCP(src, dst)
+			}
+			ns.GetUDPHandlerForFlow = func(src, dst netip.AddrPort) (func(nettype.ConnPacketConn), bool) {
+				if prefix.Contains(dst.Addr()) {
+					return nil, false // 放行到 forwardUDP
+				}
+				return oldUDP(src, dst)
+			}
+			log.Printf("installed subnet forwarding handlers for %s", prefix)
+		}
 	}
 
 	upstream, err := defaultSystemResolver()
@@ -131,6 +156,12 @@ func main() {
 	_ = udpServer.Shutdown()
 	_ = tcpServer.Shutdown()
 
+}
+
+// getNetstack 通过 unsafe 反射从 tsnet.Server 读取私有字段 netstack。
+func getNetstack(s *tsnet.Server) *netstack.Impl {
+	v := reflect.ValueOf(s).Elem().FieldByName("netstack")
+	return (*netstack.Impl)(unsafe.Pointer(v.Pointer()))
 }
 
 func envOrDefault(key, defaultValue string) string {
