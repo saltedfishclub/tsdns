@@ -39,7 +39,17 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
           registry: ${{ env.REGISTRY }}
 
+      - name: Check if Dockerfile.ko-base changed
+        id: changed
+        run: |
+          if git diff --quiet "${{ github.event.before }}" HEAD -- Dockerfile.ko-base; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build and push ko base image (Alpine + ping)
+        if: steps.changed.outputs.changed == 'true'
         run: |
           docker build -f Dockerfile.ko-base -t "${KO_DOCKER_REPO}:ko-base" .
           docker push "${KO_DOCKER_REPO}:ko-base"
