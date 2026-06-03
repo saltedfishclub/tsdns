@@ -177,11 +177,11 @@ func forwardUserNetstackUDP(src, dst netip.AddrPort) func(conn nettype.ConnPacke
 			readDeadline = 5 * time.Second
 			idleTimeout  = 30 * time.Second
 		)
-		buf := make([]byte, 65536)
 
 		// tailnet → Docker（读 gVisor, 写 kernel socket）
 		go func() {
 			defer cancel()
+			buf := make([]byte, 65536)
 			for {
 				c.SetReadDeadline(time.Now().Add(readDeadline))
 				n, _, err := c.ReadFrom(buf)
@@ -203,6 +203,7 @@ func forwardUserNetstackUDP(src, dst netip.AddrPort) func(conn nettype.ConnPacke
 		// Docker → tailnet（读 kernel socket, 写 gVisor）
 		go func() {
 			defer cancel()
+			buf := make([]byte, 65536)
 			for {
 				backend.SetReadDeadline(time.Now().Add(readDeadline))
 				n, _, err := backend.ReadFromUDP(buf)
