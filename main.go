@@ -178,6 +178,10 @@ func forwardUserNetstackUDP(src, dst netip.AddrPort) func(conn nettype.ConnPacke
 			idleTimeout  = 30 * time.Second
 		)
 
+		// activity channel: each successful forward pings the idle timer.
+		active := make(chan struct{}, 1)
+		idleTimer := time.NewTimer(idleTimeout)
+
 		// tailnet → Docker（读 gVisor, 写 kernel socket）
 		go func() {
 			defer cancel()
@@ -196,6 +200,11 @@ func forwardUserNetstackUDP(src, dst netip.AddrPort) func(conn nettype.ConnPacke
 				}
 				if _, err := backend.Write(buf[:n]); err != nil {
 					return
+				}
+				// signal activity to reset idle timer
+				select {
+				case active <- struct{}{}:
+				default:
 				}
 			}
 		}()
@@ -219,12 +228,31 @@ func forwardUserNetstackUDP(src, dst netip.AddrPort) func(conn nettype.ConnPacke
 				if _, err := c.WriteTo(buf[:n], net.UDPAddrFromAddrPort(src)); err != nil {
 					return
 				}
+				// signal activity to reset idle timer
+				select {
+				case active <- struct{}{}:
+				default:
+				}
 			}
 		}()
 
-		select {
-		case <-ctx.Done():
-		case <-time.After(idleTimeout):
+		// Wait until either the context is cancelled (error) or the
+		// connection is truly idle for idleTimeout.
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-active:
+				if !idleTimer.Stop() {
+					select {
+					case <-idleTimer.C:
+					default:
+					}
+				}
+				idleTimer.Reset(idleTimeout)
+			case <-idleTimer.C:
+				return
+			}
 		}
 	}
 }
