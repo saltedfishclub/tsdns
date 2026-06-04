@@ -200,6 +200,15 @@ func defaultSystemResolver() (string, error) {
 }
 
 func (f *Forwarder) handleRequest(w dns.ResponseWriter, r *dns.Msg) {
+	// 记录收到的查询
+	{
+		questions := make([]string, 0, len(r.Question))
+		for _, q := range r.Question {
+			questions = append(questions, fmt.Sprintf("%s %s", q.Name, dns.TypeToString[q.Qtype]))
+		}
+		log.Printf("query from %s (%s): %s", w.RemoteAddr().String(), w.RemoteAddr().Network(), strings.Join(questions, ", "))
+	}
+
 	req := r.Copy()
 	mappedResult := f.applyDomainRemap(req)
 
