@@ -10,7 +10,6 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
-	"time"
 	"unsafe"
 
 	"github.com/miekg/dns"
@@ -91,20 +90,21 @@ func main() {
 		log.Printf("advertised route prefix to tailnet: %s", prefix)
 		if _, err := os.Stat("/dev/net/tun"); err != nil {
 			log.Println("Cannot find /dev/net/tun, downgrading to unprivileged L4 forwarding mode.")
-			// 通过反射替换 gVisor netstack 的 TCP/UDP handler，
-			// 让发往广播子网的流量走内置 forwardTCP/forwardUDP（无需特权）
+			// Let gVisor's built-in forwardTCP / forwardUDP handle
+			// traffic bound for the advertised subnet — they create
+			// kernel sockets and relay without user-space state tracking.
 			ns := getNetstack(ts)
 			oldTCP := ns.GetTCPHandlerForFlow
 			oldUDP := ns.GetUDPHandlerForFlow
 			ns.GetTCPHandlerForFlow = func(src, dst netip.AddrPort) (func(net.Conn), bool) {
 				if prefix.Contains(dst.Addr()) {
-					return nil, false // 放行到 forwardTCP
+					return nil, false // use built-in forwardTCP
 				}
 				return oldTCP(src, dst)
 			}
 			ns.GetUDPHandlerForFlow = func(src, dst netip.AddrPort) (func(nettype.ConnPacketConn), bool) {
 				if prefix.Contains(dst.Addr()) {
-					return forwardUserNetstackUDP(src, dst), true
+					return nil, false // use built-in forwardUDP
 				}
 				return oldUDP(src, dst)
 			}
@@ -157,104 +157,6 @@ func main() {
 	_ = udpServer.Shutdown()
 	_ = tcpServer.Shutdown()
 
-}
-
-// this is to replace the internal implementation of tsnet which does not set deadline for udp sockets, causing program block.
-func forwardUserNetstackUDP(src, dst netip.AddrPort) func(conn nettype.ConnPacketConn) {
-	return func(c nettype.ConnPacketConn) {
-		defer c.Close()
-		backend, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(dst))
-		if err != nil {
-			log.Printf("udp: dial %v: %v", dst, err)
-			return
-		}
-		defer backend.Close()
-
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-
-		const (
-			readDeadline = 5 * time.Second
-			idleTimeout  = 30 * time.Second
-		)
-
-		// activity channel: each successful forward pings the idle timer.
-		active := make(chan struct{}, 1)
-		idleTimer := time.NewTimer(idleTimeout)
-
-		// tailnet → Docker（读 gVisor, 写 kernel socket）
-		go func() {
-			defer cancel()
-			buf := make([]byte, 65536)
-			for {
-				c.SetReadDeadline(time.Now().Add(readDeadline))
-				n, _, err := c.ReadFrom(buf)
-				if err != nil {
-					if ctx.Err() != nil {
-						return
-					}
-					if ne, ok := err.(net.Error); ok && ne.Timeout() {
-						continue
-					}
-					return
-				}
-				if _, err := backend.Write(buf[:n]); err != nil {
-					return
-				}
-				// signal activity to reset idle timer
-				select {
-				case active <- struct{}{}:
-				default:
-				}
-			}
-		}()
-
-		// Docker → tailnet（读 kernel socket, 写 gVisor）
-		go func() {
-			defer cancel()
-			buf := make([]byte, 65536)
-			for {
-				backend.SetReadDeadline(time.Now().Add(readDeadline))
-				n, _, err := backend.ReadFromUDP(buf)
-				if err != nil {
-					if ctx.Err() != nil {
-						return
-					}
-					if ne, ok := err.(net.Error); ok && ne.Timeout() {
-						continue
-					}
-					return
-				}
-				if _, err := c.WriteTo(buf[:n], net.UDPAddrFromAddrPort(src)); err != nil {
-					return
-				}
-				// signal activity to reset idle timer
-				select {
-				case active <- struct{}{}:
-				default:
-				}
-			}
-		}()
-
-		// Wait until either the context is cancelled (error) or the
-		// connection is truly idle for idleTimeout.
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-active:
-				if !idleTimer.Stop() {
-					select {
-					case <-idleTimer.C:
-					default:
-					}
-				}
-				idleTimer.Reset(idleTimeout)
-			case <-idleTimer.C:
-				return
-			}
-		}
-	}
 }
 
 // getNetstack 通过 unsafe 反射从 tsnet.Server 读取私有字段 netstack。
