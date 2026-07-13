@@ -24,6 +24,8 @@ type Forwarder struct {
 	domainRemap map[string]string
 	udpClient   dns.Client
 	tcpClient   dns.Client
+	selfZone    string
+	selfIP      net.IP
 }
 
 var (
@@ -117,17 +119,20 @@ func main() {
 		log.Fatalf("failed to read system resolver: %v", err)
 	}
 
+	ip4, _ := ts.TailscaleIPs()
+	log.Println("My IP4:", ip4.String())
+
 	forwarder := &Forwarder{
 		upstream: upstream,
 		// Placeholder for future domain remapping rules.
 		domainRemap: map[string]string{},
 		udpClient:   dns.Client{Net: "udp"},
 		tcpClient:   dns.Client{Net: "tcp"},
+		selfZone:    dns.Fqdn(zone + localTLD),
+		selfIP:      net.IP(ip4.AsSlice()),
 	}
 
 	dns.HandleFunc(".", forwarder.handleRequest)
-	ip4, _ := ts.TailscaleIPs()
-	log.Println("My IP4:", ip4.String())
 	dnsListen := ip4.String() + ":53"
 	var udp net.PacketConn
 	if udp, err = ts.ListenPacket("udp", dnsListen); err != nil {
@@ -209,6 +214,10 @@ func (f *Forwarder) handleRequest(w dns.ResponseWriter, r *dns.Msg) {
 		log.Printf("query from %s (%s): %s", w.RemoteAddr().String(), w.RemoteAddr().Network(), strings.Join(questions, ", "))
 	}
 
+	if f.answerSelfZone(w, r) {
+		return
+	}
+
 	req := r.Copy()
 	mappedResult := f.applyDomainRemap(req)
 
@@ -227,6 +236,35 @@ func (f *Forwarder) handleRequest(w dns.ResponseWriter, r *dns.Msg) {
 	f.remapDomainAnswers(resp, mappedResult)
 	resp.Id = r.Id
 	_ = w.WriteMsg(resp)
+}
+
+// answerSelfZone 对 homelabZone.localTLD 的 A 质询直接返回当前 tsnet 实例的 IP。
+func (f *Forwarder) answerSelfZone(w dns.ResponseWriter, r *dns.Msg) bool {
+	if f.selfIP == nil || len(r.Question) != 1 {
+		return false
+	}
+	q := r.Question[0]
+	if q.Qclass != dns.ClassINET || !strings.EqualFold(dns.Fqdn(q.Name), f.selfZone) {
+		return false
+	}
+	if q.Qtype != dns.TypeA {
+		return false
+	}
+
+	resp := new(dns.Msg)
+	resp.SetReply(r)
+	resp.Authoritative = true
+	resp.Answer = append(resp.Answer, &dns.A{
+		Hdr: dns.RR_Header{
+			Name:   q.Name,
+			Rrtype: dns.TypeA,
+			Class:  dns.ClassINET,
+			Ttl:    60,
+		},
+		A: f.selfIP,
+	})
+	_ = w.WriteMsg(resp)
+	return true
 }
 
 func (f *Forwarder) remapDomainAnswers(resp *dns.Msg, mapping map[string]string) {
