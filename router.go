@@ -107,9 +107,13 @@ func (r *SubnetRouter) match(dst netip.AddrPort) (PortRule, bool) {
 }
 
 // targetAddr renders a rule's rewritten destination as a host:port string. A
-// literal IP is used directly; a domain is resolved through the homelab
+// literal IP is used directly; a domain is resolved first through the homelab
 // pipeline (self zone, remap, upstream) — falling back to the cache — so both
 // container names (web-caddy-1) and homelab names (caddy.web.homelab.ice) work.
+// If the pipeline cannot resolve the name it falls back to the OS resolver,
+// which consults /etc/hosts; that is what makes targets like host.docker.internal
+// (injected by Docker's --add-host, and unknown to the upstream DNS server)
+// reachable.
 func (r *SubnetRouter) targetAddr(rule PortRule) (string, error) {
 	port := strconv.Itoa(int(rule.TargetPort))
 	host := rule.TargetHost
@@ -120,14 +124,45 @@ func (r *SubnetRouter) targetAddr(rule PortRule) (string, error) {
 	if ips := r.cache.Lookup(host); len(ips) > 0 {
 		return net.JoinHostPort(ips[0].String(), port), nil
 	}
+
 	ips, _, err := r.resolver.Resolve(host)
-	if err != nil {
-		return "", fmt.Errorf("resolve target %q: %w", host, err)
-	}
 	if len(ips) == 0 {
-		return "", fmt.Errorf("resolve target %q: no addresses", host)
+		// The homelab pipeline queries the upstream DNS server exclusively, so a
+		// target defined only in /etc/hosts (e.g. host.docker.internal from
+		// Docker's --add-host) resolves to NXDOMAIN there. Fall back to the OS
+		// resolver, which reads /etc/hosts before consulting DNS.
+		if sysIPs := lookupSystemHost(host); len(sysIPs) > 0 {
+			ips = sysIPs
+		} else if err != nil {
+			return "", fmt.Errorf("resolve target %q: %w", host, err)
+		} else {
+			return "", fmt.Errorf("resolve target %q: no addresses", host)
+		}
 	}
 	return net.JoinHostPort(ips[0].String(), port), nil
+}
+
+// systemLookupTimeout bounds a fallback lookup through the OS resolver.
+const systemLookupTimeout = 5 * time.Second
+
+// lookupSystemHost resolves host through the Go standard-library resolver, which
+// consults /etc/hosts before the DNS servers in /etc/resolv.conf. It lets
+// port-map targets that live only in /etc/hosts — notably host.docker.internal,
+// injected by Docker's --add-host=host.docker.internal:host-gateway — resolve
+// even though the homelab pipeline queries the upstream DNS server exclusively.
+// It returns nil on error or no result, which callers treat as "unresolved".
+func lookupSystemHost(host string) []netip.Addr {
+	ctx, cancel := context.WithTimeout(context.Background(), systemLookupTimeout)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	if err != nil {
+		return nil
+	}
+	out := make([]netip.Addr, 0, len(ips))
+	for _, ip := range ips {
+		out = append(out, ip.Unmap())
+	}
+	return out
 }
 
 func (r *SubnetRouter) hijackTCP(client net.Conn, rule PortRule) {

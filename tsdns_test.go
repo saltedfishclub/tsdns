@@ -119,6 +119,35 @@ func TestTargetAddr(t *testing.T) {
 	}
 }
 
+func TestTargetAddrSystemFallback(t *testing.T) {
+	// When the homelab pipeline can't resolve a target, targetAddr falls back to
+	// the OS resolver, which reads /etc/hosts. "localhost" stands in for a name
+	// that lives outside the upstream DNS server, like host.docker.internal from
+	// Docker's --add-host.
+	if lookupSystemHost("localhost") == nil {
+		t.Skip("system resolver does not resolve localhost in this environment")
+	}
+	resolver := resolverFunc(func(string) ([]netip.Addr, time.Duration, error) {
+		return nil, 0, fmt.Errorf("upstream rcode NXDOMAIN") // mimics the Docker embedded DNS miss
+	})
+	r := NewSubnetRouter(netip.MustParsePrefix("10.1.0.0/27"), nil, NewResolveCache(), resolver)
+
+	addr, err := r.targetAddr(PortRule{TargetHost: "localhost", TargetPort: 22})
+	if err != nil {
+		t.Fatalf("targetAddr(localhost) did not fall back to the OS resolver: %v", err)
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("bad addr %q: %v", addr, err)
+	}
+	if port != "22" {
+		t.Errorf("port = %q, want 22", port)
+	}
+	if ip, err := netip.ParseAddr(host); err != nil || !ip.IsLoopback() {
+		t.Errorf("host = %q, want a loopback address", host)
+	}
+}
+
 func TestResolveCachePutLookup(t *testing.T) {
 	c := NewResolveCache()
 	now := time.Unix(1_000_000, 0)
