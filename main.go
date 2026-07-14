@@ -7,358 +7,133 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"reflect"
-	"strconv"
-	"strings"
-	"unsafe"
 
 	"github.com/miekg/dns"
 	"tailscale.com/ipn"
 	"tailscale.com/tsnet"
-	"tailscale.com/types/nettype"
-	"tailscale.com/wgengine/netstack"
-)
-
-type Forwarder struct {
-	upstream    string
-	domainRemap map[string]string
-	udpClient   dns.Client
-	tcpClient   dns.Client
-	selfZone    string
-	selfIP      net.IP
-}
-
-var (
-	tsHostname     = envOrDefault("TS_HOSTNAME", "tsdns")
-	tsStateDir     = envOrDefault("TS_STATE_DIR", "")
-	tsPreferPort   = envOrDefault("TS_PREFER_PORT", "")
-	homelabZone    = envOrDefault("HOMELAB_ZONE", "homelab")
-	localTLD       = envOrDefault("HOMELAB_TLD", "local")
-	advertiseRoute = envOrDefault("ADVERTISE_ROUTE", "")
 )
 
 func main() {
-	tsnetVerbose, err := envBoolOrDefault("TS_VERBOSE", false)
+	cfg, err := LoadConfig()
 	if err != nil {
-		log.Fatalf("invalid TS_VERBOSE value: %v", err)
-	}
-	if len(localTLD) == 0 || localTLD[0] != '.' {
-		localTLD = "." + localTLD
+		log.Fatalf("config: %v", err)
 	}
 
 	ctx := context.Background()
-	zone := strings.Trim(strings.ToLower(homelabZone), ".")
-	if zone == "" {
-		log.Fatalf("invalid HOMELAB_ZONE %q", homelabZone)
-	}
 
 	ts := &tsnet.Server{
-		Hostname: tsHostname,
-		Dir:      tsStateDir,
+		Hostname: cfg.Hostname,
+		Dir:      cfg.StateDir,
+		Port:     cfg.PreferPort,
 	}
-	if preferPort, err := strconv.Atoi(tsPreferPort); err == nil {
-		ts.Port = uint16(preferPort)
+	if cfg.Verbose {
+		ts.Logf = log.New(os.Stderr, fmt.Sprintf("[tsnet:%s] ", cfg.Hostname), log.LstdFlags).Printf
 	}
+	defer ts.Close()
 
-	if tsnetVerbose {
-		ts.Logf = log.New(os.Stderr, fmt.Sprintf("[tsnet:%s] ", tsHostname), log.LstdFlags).Printf
-	}
-	defer func() {
-		_ = ts.Close()
-	}()
 	if _, err := ts.Up(ctx); err != nil {
 		log.Fatalf("tailscale bring-up failed: %v", err)
-	}
-
-	lc, err := ts.LocalClient()
-	if err != nil {
-		log.Fatalf("tailscale local client failed: %v", err)
-	}
-
-	if advertiseRoute != "" {
-		prefix, err := netip.ParsePrefix(advertiseRoute)
-		if err != nil {
-			log.Fatalf("invalid ADVERTISE_ROUTE %q: %v", advertiseRoute, err)
-		}
-		_, err = lc.EditPrefs(ctx, &ipn.MaskedPrefs{
-			Prefs: ipn.Prefs{
-				AdvertiseRoutes: []netip.Prefix{prefix},
-			},
-			AdvertiseRoutesSet: true,
-		})
-		if err != nil {
-			log.Fatalf("failed to advertise route %s: %v", prefix, err)
-		}
-		log.Printf("advertised route prefix to tailnet: %s", prefix)
-		if _, err := os.Stat("/dev/net/tun"); err != nil {
-			log.Println("Cannot find /dev/net/tun, downgrading to unprivileged L4 forwarding mode.")
-			// Let gVisor's built-in forwardTCP / forwardUDP handle
-			// traffic bound for the advertised subnet — they create
-			// kernel sockets and relay without user-space state tracking.
-			ns := getNetstack(ts)
-			oldTCP := ns.GetTCPHandlerForFlow
-			oldUDP := ns.GetUDPHandlerForFlow
-			ns.GetTCPHandlerForFlow = func(src, dst netip.AddrPort) (func(net.Conn), bool) {
-				if prefix.Contains(dst.Addr()) {
-					return nil, false // use built-in forwardTCP
-				}
-				return oldTCP(src, dst)
-			}
-			ns.GetUDPHandlerForFlow = func(src, dst netip.AddrPort) (func(nettype.ConnPacketConn), bool) {
-				if prefix.Contains(dst.Addr()) {
-					return nil, false // use built-in forwardUDP
-				}
-				return oldUDP(src, dst)
-			}
-			log.Printf("installed subnet forwarding handlers for %s", prefix)
-		}
-	}
-
-	upstream, err := defaultSystemResolver()
-	if err != nil {
-		log.Fatalf("failed to read system resolver: %v", err)
 	}
 
 	ip4, _ := ts.TailscaleIPs()
 	log.Println("My IP4:", ip4.String())
 
-	forwarder := &Forwarder{
-		upstream: upstream,
-		// Placeholder for future domain remapping rules.
-		domainRemap: map[string]string{},
-		udpClient:   dns.Client{Net: "udp"},
-		tcpClient:   dns.Client{Net: "tcp"},
-		selfZone:    dns.Fqdn(zone + localTLD),
-		selfIP:      net.IP(ip4.AsSlice()),
+	cache := NewResolveCache()
+
+	if err := setupSubnetRouting(ctx, ts, cfg, cache); err != nil {
+		log.Fatalf("subnet routing: %v", err)
 	}
 
-	dns.HandleFunc(".", forwarder.handleRequest)
-	dnsListen := ip4.String() + ":53"
-	var udp net.PacketConn
-	if udp, err = ts.ListenPacket("udp", dnsListen); err != nil {
-		log.Fatalf("failed to listen packet conn on: %v", err)
+	upstream, err := SystemUpstream()
+	if err != nil {
+		log.Fatalf("failed to read system resolver: %v", err)
 	}
-	udpServer := &dns.Server{Addr: dnsListen, Net: "udp", PacketConn: udp}
-	var tcp net.Listener
-	if tcp, err = ts.Listen("tcp", dnsListen); err != nil {
-		log.Fatalf("failed to listen: %v", err)
+
+	forwarder := NewForwarder(cfg, upstream, net.IP(ip4.AsSlice()), cache)
+	if err := serveDNS(ts, forwarder, ip4.String()+":53", upstream); err != nil {
+		log.Fatalf("dns server failed: %v", err)
 	}
-	tcpServer := &dns.Server{Addr: dnsListen, Net: "tcp", Listener: tcp}
+}
+
+// setupSubnetRouting advertises the configured route and, when running in
+// userspace forwarding mode, installs the subnet router (which also applies
+// port-mapping hijack rules).
+func setupSubnetRouting(ctx context.Context, ts *tsnet.Server, cfg *Config, cache *ResolveCache) error {
+	rules, err := loadPortRules(cfg)
+	if err != nil {
+		return err
+	}
+
+	if !cfg.AdvertiseRoute.IsValid() {
+		if len(rules) > 0 {
+			log.Print("warning: PORT_MAP_FILE set but ADVERTISE_ROUTE is empty; no traffic will be intercepted")
+		}
+		return nil
+	}
+
+	lc, err := ts.LocalClient()
+	if err != nil {
+		return fmt.Errorf("tailscale local client: %w", err)
+	}
+	if _, err := lc.EditPrefs(ctx, &ipn.MaskedPrefs{
+		Prefs:              ipn.Prefs{AdvertiseRoutes: []netip.Prefix{cfg.AdvertiseRoute}},
+		AdvertiseRoutesSet: true,
+	}); err != nil {
+		return fmt.Errorf("advertise route %s: %w", cfg.AdvertiseRoute, err)
+	}
+	log.Printf("advertised route prefix to tailnet: %s", cfg.AdvertiseRoute)
+
+	if hasTUN() {
+		if len(rules) > 0 {
+			log.Print("warning: /dev/net/tun present; port-mapping hijack only applies in userspace forwarding mode")
+		}
+		return nil
+	}
+	log.Println("no /dev/net/tun; using userspace L4 forwarding")
+
+	return NewSubnetRouter(cfg.AdvertiseRoute, rules, cache).Install(ts)
+}
+
+func loadPortRules(cfg *Config) (PortRules, error) {
+	if cfg.PortMapFile == "" {
+		return nil, nil
+	}
+	rules, err := LoadPortRules(cfg.PortMapFile)
+	if err != nil {
+		return nil, fmt.Errorf("load port map %q: %w", cfg.PortMapFile, err)
+	}
+	log.Printf("loaded %d port-mapping rule(s) from %s", len(rules), cfg.PortMapFile)
+	return rules, nil
+}
+
+func serveDNS(ts *tsnet.Server, f *Forwarder, addr, upstream string) error {
+	dns.HandleFunc(".", f.HandleRequest)
+
+	udpConn, err := ts.ListenPacket("udp", addr)
+	if err != nil {
+		return fmt.Errorf("listen udp %s: %w", addr, err)
+	}
+	tcpLn, err := ts.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen tcp %s: %w", addr, err)
+	}
+
+	udpServer := &dns.Server{Addr: addr, Net: "udp", PacketConn: udpConn}
+	tcpServer := &dns.Server{Addr: addr, Net: "tcp", Listener: tcpLn}
 
 	errCh := make(chan error, 2)
-	go func() {
-		errCh <- udpServer.ActivateAndServe()
-	}()
-	go func() {
-		errCh <- tcpServer.ActivateAndServe()
-	}()
+	go func() { errCh <- udpServer.ActivateAndServe() }()
+	go func() { errCh <- tcpServer.ActivateAndServe() }()
 
-	log.Printf("dns forwarder listening on %s (udp/tcp), upstream %s", dnsListen, upstream)
+	log.Printf("dns forwarder listening on %s (udp/tcp), upstream %s", addr, upstream)
 
-	if serveErr := <-errCh; serveErr != nil {
-		log.Fatalf("dns server failed: %v", serveErr)
-	}
-
+	err = <-errCh
 	_ = udpServer.Shutdown()
 	_ = tcpServer.Shutdown()
-
+	return err
 }
 
-// getNetstack 通过 unsafe 反射从 tsnet.Server 读取私有字段 netstack。
-func getNetstack(s *tsnet.Server) *netstack.Impl {
-	v := reflect.ValueOf(s).Elem().FieldByName("netstack")
-	return (*netstack.Impl)(unsafe.Pointer(v.Pointer()))
-}
-
-func envOrDefault(key, defaultValue string) string {
-	if value, ok := os.LookupEnv(key); ok {
-		return value
-	}
-	return defaultValue
-}
-
-func envBoolOrDefault(key string, defaultValue bool) (bool, error) {
-	value, ok := os.LookupEnv(key)
-	if !ok {
-		return defaultValue, nil
-	}
-	parsed, err := strconv.ParseBool(value)
-	if err != nil {
-		return false, fmt.Errorf("%s=%q (%w)", key, value, err)
-	}
-	return parsed, nil
-}
-
-func defaultSystemResolver() (string, error) {
-	cfg, err := dns.ClientConfigFromFile("/etc/resolv.conf")
-	if err != nil {
-		return "", err
-	}
-	if len(cfg.Servers) == 0 {
-		return "", fmt.Errorf("no system DNS servers in /etc/resolv.conf")
-	}
-	port := cfg.Port
-	if port == "" {
-		port = "53"
-	}
-	return net.JoinHostPort(cfg.Servers[0], port), nil
-}
-
-func (f *Forwarder) handleRequest(w dns.ResponseWriter, r *dns.Msg) {
-	// 记录收到的查询
-	{
-		questions := make([]string, 0, len(r.Question))
-		for _, q := range r.Question {
-			questions = append(questions, fmt.Sprintf("%s %s", q.Name, dns.TypeToString[q.Qtype]))
-		}
-		log.Printf("query from %s (%s): %s", w.RemoteAddr().String(), w.RemoteAddr().Network(), strings.Join(questions, ", "))
-	}
-
-	if f.answerSelfZone(w, r) {
-		return
-	}
-
-	req := r.Copy()
-	mappedResult := f.applyDomainRemap(req)
-
-	resp, _, err := f.udpClient.Exchange(req, f.upstream)
-	if err == nil && resp != nil && resp.Truncated {
-		resp, _, err = f.tcpClient.Exchange(req, f.upstream)
-	}
-
-	if err != nil || resp == nil {
-		fail := new(dns.Msg)
-		fail.SetRcode(r, dns.RcodeServerFailure)
-		_ = w.WriteMsg(fail)
-		return
-	}
-
-	f.remapDomainAnswers(resp, mappedResult)
-	resp.Id = r.Id
-	_ = w.WriteMsg(resp)
-}
-
-// answerSelfZone 对 homelabZone.localTLD 的 A 质询直接返回当前 tsnet 实例的 IP。
-func (f *Forwarder) answerSelfZone(w dns.ResponseWriter, r *dns.Msg) bool {
-	if f.selfIP == nil || len(r.Question) != 1 {
-		return false
-	}
-	q := r.Question[0]
-	if q.Qclass != dns.ClassINET || !strings.EqualFold(dns.Fqdn(q.Name), f.selfZone) {
-		return false
-	}
-	if q.Qtype != dns.TypeA {
-		return false
-	}
-
-	resp := new(dns.Msg)
-	resp.SetReply(r)
-	resp.Authoritative = true
-	resp.Answer = append(resp.Answer, &dns.A{
-		Hdr: dns.RR_Header{
-			Name:   q.Name,
-			Rrtype: dns.TypeA,
-			Class:  dns.ClassINET,
-			Ttl:    60,
-		},
-		A: f.selfIP,
-	})
-	_ = w.WriteMsg(resp)
-	return true
-}
-
-func (f *Forwarder) remapDomainAnswers(resp *dns.Msg, mapping map[string]string) {
-	remapName := func(name string) string {
-		if og, ok := mapping[name]; ok {
-			return og
-		}
-		return name
-	}
-
-	// Question section — use index to actually modify the slice element
-	for i := range resp.Question {
-		if og, ok := mapping[resp.Question[i].Name]; ok {
-			resp.Question[i].Name = og
-		}
-	}
-
-	// Remap an individual RR: restore header Name + known RDATA domain fields
-	remapRR := func(rr dns.RR) {
-		hdr := rr.Header()
-		if og, ok := mapping[hdr.Name]; ok {
-			hdr.Name = og
-		}
-		switch v := rr.(type) {
-		case *dns.CNAME:
-			v.Target = remapName(v.Target)
-		case *dns.DNAME:
-			v.Target = remapName(v.Target)
-		case *dns.NS:
-			v.Ns = remapName(v.Ns)
-		case *dns.MX:
-			v.Mx = remapName(v.Mx)
-		case *dns.SRV:
-			v.Target = remapName(v.Target)
-		case *dns.PTR:
-			v.Ptr = remapName(v.Ptr)
-		case *dns.NAPTR:
-			v.Replacement = remapName(v.Replacement)
-		}
-	}
-
-	for _, rr := range resp.Answer {
-		remapRR(rr)
-	}
-	for _, rr := range resp.Ns {
-		remapRR(rr)
-	}
-	for _, rr := range resp.Extra {
-		remapRR(rr)
-	}
-}
-
-// return a mapping of mapped to original domain
-func (f *Forwarder) applyDomainRemap(req *dns.Msg) map[string]string {
-	theMap := make(map[string]string)
-	for i := range req.Question {
-		name := dns.Fqdn(req.Question[i].Name)
-		if mapped, ok := f.domainRemap[name]; ok {
-			theMap[dns.Fqdn(mapped)] = name
-			req.Question[i].Name = dns.Fqdn(mapped)
-			continue
-		}
-		if mapped, ok := remapHomelabName(name, homelabZone); ok {
-			theMap[mapped] = name
-			req.Question[i].Name = mapped
-		}
-	}
-	return theMap
-}
-
-func remapHomelabName(name, homelabZone string) (string, bool) {
-	indexOfTLD := strings.LastIndex(name, localTLD)
-	if indexOfTLD < 0 {
-		return "", false
-	}
-	labels := dns.SplitDomainName(name[:indexOfTLD])
-	if len(labels) < 3 {
-		return "", false
-	}
-	_len := len(labels)
-	if _len < 3 {
-		return "", false
-	}
-	labels = labels[_len-3 : _len]
-	service := labels[0]
-	project := labels[1]
-	zone := labels[2]
-	if zone != homelabZone {
-		return "", false
-	}
-	if service == "" || project == "" {
-		return "", false
-	}
-	mapped := fmt.Sprintf("%s-%s-1.", project, service)
-	log.Println("Remapping", name, "to", mapped)
-	return mapped, true
+func hasTUN() bool {
+	_, err := os.Stat("/dev/net/tun")
+	return err == nil
 }

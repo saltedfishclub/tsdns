@@ -41,3 +41,51 @@ $ dig @100.64.0.1 +short caddy.web.homelab.lan
 ```
 
 With proper dns setup, you can visit that caddy over browser directly.
+
+## Port mapping (connection hijacking)
+
+While acting as a subnet router, tsdns observes every TCP/UDP flow the tailnet
+routes into the advertised subnet. With a port-mapping file you can hijack
+selected flows and relay them to a different destination.
+
+Set `PORT_MAP_FILE` to a file whose lines are:
+
+```
+<original-dest> <original-port> <rewritten-dest> <rewritten-port>
+```
+
+* `original-dest` and `rewritten-dest` may each be a literal IP or a domain.
+* Blank lines and lines starting with `#` are ignored.
+* A rule applies to both TCP and UDP; the first matching rule wins.
+
+When `original-dest` is a domain, it is matched against the IPs that domain
+most recently resolved to *through tsdns itself* (its answer cache). So a client
+that looks up `caddy.web.homelab.lan` and then connects is transparently
+redirected:
+
+```
+# redirect caddy's HTTP to an internal backend
+caddy.web.homelab.lan 80 10.1.0.9 8080
+
+# redirect a fixed subnet IP to another host:port
+10.1.0.3 443 secure.internal 8443
+```
+
+`rewritten-dest` is dialed from tsdns: a literal IP is used directly, and a
+domain is resolved via the answer cache when known, otherwise by the host
+resolver.
+
+> Port mapping is only active in userspace forwarding mode (i.e. when
+> `/dev/net/tun` is absent, as in the unprivileged container above), the same
+> mode used for subnet routing.
+
+Add it to the compose example with a mounted file:
+
+```yaml
+    environment:
+      # ...existing vars...
+      PORT_MAP_FILE: "/config/portmap"
+    volumes:
+      - "./state:/ts-state"
+      - "./portmap:/config/portmap:ro"
+```
