@@ -45,8 +45,8 @@ With proper dns setup, you can visit that caddy over browser directly.
 ## Port mapping (connection hijacking)
 
 While acting as a subnet router, tsdns observes every TCP/UDP flow the tailnet
-routes into the advertised subnet. With a port-mapping file you can hijack
-selected flows and relay them to a different destination.
+routes to it. With a port-mapping file you can hijack selected flows and relay
+them to a different destination.
 
 Set `PORT_MAP_FILE` to a file whose lines are:
 
@@ -58,22 +58,32 @@ Set `PORT_MAP_FILE` to a file whose lines are:
 * Blank lines and lines starting with `#` are ignored.
 * A rule applies to both TCP and UDP; the first matching rule wins.
 
-When `original-dest` is a domain, it is matched against the IPs that domain
-most recently resolved to *through tsdns itself* (its answer cache). So a client
-that looks up `caddy.web.homelab.lan` and then connects is transparently
-redirected:
+When `original-dest` is a domain, tsdns resolves it *itself* — using the same
+self-zone / homelab / upstream pipeline it serves to clients — and keeps that
+result cached and periodically refreshed. A flow is hijacked when its
+destination IP and port match a rule, so matching does not depend on a client's
+DNS cache being in sync and keeps working across tsdns restarts.
+
+Because the node's own zone (`<zone><tld>`) resolves to this node, you can also
+hijack traffic aimed at tsdns itself — handy for turning it into a jump target:
 
 ```
-# redirect caddy's HTTP to an internal backend
+# ssh to this node on 2222 -> the LAN host's sshd
+homelab.lan 2222 10.0.0.119 22
+
+# redirect a container's HTTP to an internal backend
 caddy.web.homelab.lan 80 10.1.0.9 8080
 
 # redirect a fixed subnet IP to another host:port
 10.1.0.3 443 secure.internal 8443
 ```
 
+> The `<original-port>` is the port the client connects to, and `<original-dest>`
+> is the name/IP the client targets — not the backend's. To ssh via
+> `ssh homelab.lan -p 2222`, the rule's original side must be `homelab.lan 2222`.
+
 `rewritten-dest` is dialed from tsdns: a literal IP is used directly, and a
-domain is resolved via the answer cache when known, otherwise by the host
-resolver.
+domain is resolved via the cache when known, otherwise by the host resolver.
 
 > Port mapping is only active in userspace forwarding mode (i.e. when
 > `/dev/net/tun` is absent, as in the unprivileged container above), the same

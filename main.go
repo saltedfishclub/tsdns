@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"net"
 	"net/netip"
 	"os"
 
@@ -35,21 +34,29 @@ func main() {
 		log.Fatalf("tailscale bring-up failed: %v", err)
 	}
 
-	ip4, _ := ts.TailscaleIPs()
+	ip4, ip6 := ts.TailscaleIPs()
 	log.Println("My IP4:", ip4.String())
 
-	cache := NewResolveCache()
-
-	if err := setupSubnetRouting(ctx, ts, cfg, cache); err != nil {
-		log.Fatalf("subnet routing: %v", err)
+	rules, err := loadPortRules(cfg)
+	if err != nil {
+		log.Fatalf("%v", err)
 	}
 
+	cache := NewResolveCache()
 	upstream, err := SystemUpstream()
 	if err != nil {
 		log.Fatalf("failed to read system resolver: %v", err)
 	}
+	forwarder := NewForwarder(cfg, upstream, ip4, ip6, cache)
 
-	forwarder := NewForwarder(cfg, upstream, net.IP(ip4.AsSlice()), cache)
+	// Warm the cache for rule domains (including the self zone) before
+	// advertising the route, so hijack matching is ready when traffic arrives.
+	StartRuleResolver(forwarder, cache, rules)
+
+	if err := setupSubnetRouting(ctx, ts, cfg, rules, cache); err != nil {
+		log.Fatalf("subnet routing: %v", err)
+	}
+
 	if err := serveDNS(ts, forwarder, ip4.String()+":53", upstream); err != nil {
 		log.Fatalf("dns server failed: %v", err)
 	}
@@ -58,12 +65,7 @@ func main() {
 // setupSubnetRouting advertises the configured route and, when running in
 // userspace forwarding mode, installs the subnet router (which also applies
 // port-mapping hijack rules).
-func setupSubnetRouting(ctx context.Context, ts *tsnet.Server, cfg *Config, cache *ResolveCache) error {
-	rules, err := loadPortRules(cfg)
-	if err != nil {
-		return err
-	}
-
+func setupSubnetRouting(ctx context.Context, ts *tsnet.Server, cfg *Config, rules PortRules, cache *ResolveCache) error {
 	if !cfg.AdvertiseRoute.IsValid() {
 		if len(rules) > 0 {
 			log.Print("warning: PORT_MAP_FILE set but ADVERTISE_ROUTE is empty; no traffic will be intercepted")

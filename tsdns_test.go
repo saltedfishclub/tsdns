@@ -138,7 +138,7 @@ func TestAddrFromIP(t *testing.T) {
 
 func testForwarder() *Forwarder {
 	cfg := &Config{HomelabZone: "homelab", LocalTLD: ".lan"}
-	return NewForwarder(cfg, "127.0.0.1:53", net.ParseIP("100.64.0.1"), NewResolveCache())
+	return NewForwarder(cfg, "127.0.0.1:53", netip.MustParseAddr("100.64.0.1"), netip.Addr{}, NewResolveCache())
 }
 
 func TestRemapHomelabName(t *testing.T) {
@@ -158,6 +158,27 @@ func TestRemapHomelabName(t *testing.T) {
 		if got, ok := f.remapHomelabName(c.in); ok != c.wantOK || got != c.want {
 			t.Errorf("remapHomelabName(%q) = (%q, %v), want (%q, %v)", c.in, got, ok, c.want, c.wantOK)
 		}
+	}
+}
+
+func TestRemapQuery(t *testing.T) {
+	f := testForwarder()
+	if got := f.remapQuery("caddy.web.homelab.lan."); got != "web-caddy-1." {
+		t.Errorf("remapQuery(homelab) = %q, want web-caddy-1.", got)
+	}
+	if got := f.remapQuery("example.com."); got != "example.com." {
+		t.Errorf("remapQuery(passthrough) = %q, want example.com.", got)
+	}
+}
+
+func TestResolveSelfZone(t *testing.T) {
+	f := testForwarder() // self zone homelab.lan., self4 = 100.64.0.1, no self6
+	ips, _, err := f.Resolve("homelab.lan")
+	if err != nil {
+		t.Fatalf("Resolve(self zone): %v", err)
+	}
+	if len(ips) != 1 || ips[0] != netip.MustParseAddr("100.64.0.1") {
+		t.Fatalf("Resolve(self zone) = %v, want [100.64.0.1]", ips)
 	}
 }
 

@@ -56,11 +56,15 @@ func (r *SubnetRouter) Install(ts *tsnet.Server) error {
 	oldTCP := ns.GetTCPHandlerForFlow
 	oldUDP := ns.GetUDPHandlerForFlow
 
+	// A rule is matched before the prefix check so a rule can also hijack
+	// traffic to this node's own address (e.g. the self zone), not just the
+	// advertised subnet. Unmatched subnet traffic is handed to gVisor's
+	// built-in forwarder; anything else falls back to tsnet's own dispatch.
 	ns.GetTCPHandlerForFlow = func(src, dst netip.AddrPort) (func(net.Conn), bool) {
+		if rule, ok := r.match(dst); ok {
+			return func(c net.Conn) { r.hijackTCP(c, rule) }, true
+		}
 		if r.prefix.Contains(dst.Addr()) {
-			if rule, ok := r.match(dst); ok {
-				return func(c net.Conn) { r.hijackTCP(c, rule) }, true
-			}
 			return nil, false // use gVisor's built-in forwardTCP to the real dest
 		}
 		if oldTCP != nil {
@@ -70,10 +74,10 @@ func (r *SubnetRouter) Install(ts *tsnet.Server) error {
 	}
 
 	ns.GetUDPHandlerForFlow = func(src, dst netip.AddrPort) (func(nettype.ConnPacketConn), bool) {
+		if rule, ok := r.match(dst); ok {
+			return func(c nettype.ConnPacketConn) { r.hijackUDP(c, rule) }, true
+		}
 		if r.prefix.Contains(dst.Addr()) {
-			if rule, ok := r.match(dst); ok {
-				return func(c nettype.ConnPacketConn) { r.hijackUDP(c, rule) }, true
-			}
 			return nil, false // use gVisor's built-in forwardUDP to the real dest
 		}
 		if oldUDP != nil {

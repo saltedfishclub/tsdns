@@ -20,7 +20,8 @@ type Forwarder struct {
 	homelabZone string // e.g. "homelab"
 	localTLD    string // e.g. ".lan"
 	selfZone    string // FQDN answered with this node's own IP, e.g. "homelab.lan."
-	selfIP      net.IP
+	self4       netip.Addr
+	self6       netip.Addr
 
 	// domainRemap is an optional static name→name rewrite applied before the
 	// homelab convention. Currently unused but kept as an extension point.
@@ -33,14 +34,15 @@ type Forwarder struct {
 }
 
 // NewForwarder builds a Forwarder from the config, its resolved upstream, this
-// node's Tailscale IP, and the shared resolution cache.
-func NewForwarder(cfg *Config, upstream string, selfIP net.IP, cache *ResolveCache) *Forwarder {
+// node's Tailscale IPs, and the shared resolution cache.
+func NewForwarder(cfg *Config, upstream string, self4, self6 netip.Addr, cache *ResolveCache) *Forwarder {
 	return &Forwarder{
 		upstream:    upstream,
 		homelabZone: cfg.HomelabZone,
 		localTLD:    cfg.LocalTLD,
 		selfZone:    dns.Fqdn(cfg.SelfZone()),
-		selfIP:      selfIP,
+		self4:       self4,
+		self6:       self6,
 		domainRemap: map[string]string{},
 		cache:       cache,
 		udpClient:   dns.Client{Net: "udp"},
@@ -76,24 +78,41 @@ func (f *Forwarder) HandleRequest(w dns.ResponseWriter, r *dns.Msg) {
 	_ = w.WriteMsg(resp)
 }
 
-// answerSelfZone replies to an A query for the homelab zone itself with this
-// node's Tailscale IP. Returns true if it handled the request.
+// answerSelfZone authoritatively answers A/AAAA queries for the homelab zone
+// itself with this node's Tailscale IPs. It returns true if it handled the
+// request, including the NODATA case (an authoritative empty reply) so such
+// queries never leak to the upstream. Returns false only when the node has no
+// address at all.
 func (f *Forwarder) answerSelfZone(w dns.ResponseWriter, r *dns.Msg) bool {
-	if f.selfIP == nil || len(r.Question) != 1 {
+	if !f.self4.IsValid() && !f.self6.IsValid() {
+		return false
+	}
+	if len(r.Question) != 1 {
 		return false
 	}
 	q := r.Question[0]
-	if q.Qclass != dns.ClassINET || q.Qtype != dns.TypeA || !strings.EqualFold(dns.Fqdn(q.Name), f.selfZone) {
+	if q.Qclass != dns.ClassINET || !strings.EqualFold(dns.Fqdn(q.Name), f.selfZone) {
+		return false
+	}
+	if q.Qtype != dns.TypeA && q.Qtype != dns.TypeAAAA {
 		return false
 	}
 
 	resp := new(dns.Msg)
 	resp.SetReply(r)
 	resp.Authoritative = true
-	resp.Answer = append(resp.Answer, &dns.A{
-		Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
-		A:   f.selfIP,
-	})
+	if q.Qtype == dns.TypeA && f.self4.IsValid() {
+		resp.Answer = append(resp.Answer, &dns.A{
+			Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+			A:   f.self4.AsSlice(),
+		})
+	}
+	if q.Qtype == dns.TypeAAAA && f.self6.IsValid() {
+		resp.Answer = append(resp.Answer, &dns.AAAA{
+			Hdr:  dns.RR_Header{Name: q.Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 60},
+			AAAA: f.self6.AsSlice(),
+		})
+	}
 	_ = w.WriteMsg(resp)
 	return true
 }
@@ -113,6 +132,7 @@ func (f *Forwarder) applyDomainRemap(req *dns.Msg) map[string]string {
 			continue
 		}
 		if mapped, ok := f.remapHomelabName(name); ok {
+			log.Println("Remapping", name, "to", mapped)
 			restore[mapped] = name
 			req.Question[i].Name = mapped
 		}
@@ -136,9 +156,19 @@ func (f *Forwarder) remapHomelabName(name string) (string, bool) {
 	if zone != f.homelabZone || service == "" || project == "" {
 		return "", false
 	}
-	mapped := fmt.Sprintf("%s-%s-1.", project, service)
-	log.Println("Remapping", name, "to", mapped)
-	return mapped, true
+	return fmt.Sprintf("%s-%s-1.", project, service), true
+}
+
+// remapQuery returns the name that should actually be queried upstream for the
+// given client-facing name, applying the static and homelab remaps.
+func (f *Forwarder) remapQuery(fqdn string) string {
+	if mapped, ok := f.domainRemap[fqdn]; ok {
+		return dns.Fqdn(mapped)
+	}
+	if mapped, ok := f.remapHomelabName(fqdn); ok {
+		return mapped
+	}
+	return fqdn
 }
 
 // remapDomainAnswers restores rewritten names in a response back to the names
@@ -235,6 +265,103 @@ func logQuery(w dns.ResponseWriter, r *dns.Msg) {
 	}
 	log.Printf("query from %s (%s): %s",
 		w.RemoteAddr().String(), w.RemoteAddr().Network(), strings.Join(questions, ", "))
+}
+
+// selfZoneTTL is the cache lifetime used for the node's own zone, which never
+// changes; the background resolver re-affirms it well within this window.
+const selfZoneTTL = 5 * time.Minute
+
+// Resolve looks up the addresses of name using the same pipeline as
+// HandleRequest: the self zone is answered locally, other names are
+// homelab-remapped and queried upstream (A records). It returns the addresses
+// and the smallest record TTL, and is used to keep hijack rules resolvable
+// without depending on client query traffic.
+func (f *Forwarder) Resolve(name string) ([]netip.Addr, time.Duration, error) {
+	fqdn := dns.Fqdn(name)
+
+	if strings.EqualFold(fqdn, f.selfZone) {
+		var ips []netip.Addr
+		if f.self4.IsValid() {
+			ips = append(ips, f.self4)
+		}
+		if f.self6.IsValid() {
+			ips = append(ips, f.self6)
+		}
+		return ips, selfZoneTTL, nil
+	}
+
+	m := new(dns.Msg)
+	m.SetQuestion(f.remapQuery(fqdn), dns.TypeA)
+	resp, _, err := f.udpClient.Exchange(m, f.upstream)
+	if err != nil {
+		return nil, 0, err
+	}
+	if resp == nil {
+		return nil, 0, fmt.Errorf("no response from upstream")
+	}
+	if resp.Rcode != dns.RcodeSuccess {
+		return nil, 0, fmt.Errorf("upstream rcode %s", dns.RcodeToString[resp.Rcode])
+	}
+
+	var ips []netip.Addr
+	var ttl uint32
+	for _, rr := range resp.Answer {
+		a, ok := rr.(*dns.A)
+		if !ok {
+			continue
+		}
+		if ip, ok := addrFromIP(a.A); ok {
+			ips = append(ips, ip)
+			if ttl == 0 || a.Hdr.Ttl < ttl {
+				ttl = a.Hdr.Ttl
+			}
+		}
+	}
+	return ips, time.Duration(ttl) * time.Second, nil
+}
+
+const ruleRefreshInterval = 30 * time.Second
+
+// StartRuleResolver keeps the resolution cache warm for every domain used as a
+// port rule's original destination, so hijack matching works even when a client
+// resolves the name from its own DNS cache (or after tsdns restarts while the
+// client's cache is still valid). It resolves once synchronously, then refreshes
+// in the background.
+func StartRuleResolver(f *Forwarder, cache *ResolveCache, rules PortRules) {
+	seen := make(map[string]bool)
+	var domains []string
+	for _, r := range rules {
+		if r.MatchHost != "" && !seen[r.MatchHost] {
+			seen[r.MatchHost] = true
+			domains = append(domains, r.MatchHost)
+		}
+	}
+	if len(domains) == 0 {
+		return
+	}
+
+	refresh := func() {
+		for _, d := range domains {
+			ips, ttl, err := f.Resolve(d)
+			if err != nil {
+				log.Printf("port-map: cannot resolve rule domain %s: %v", d, err)
+				continue
+			}
+			if len(ips) == 0 {
+				log.Printf("port-map: rule domain %s resolved to no addresses", d)
+				continue
+			}
+			cache.Put(d, ips, ttl)
+		}
+	}
+
+	refresh() // warm the cache before serving/routing begins
+	go func() {
+		for {
+			time.Sleep(ruleRefreshInterval)
+			refresh()
+		}
+	}()
 }
 
 // SystemUpstream reads the first nameserver from /etc/resolv.conf and returns
