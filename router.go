@@ -24,25 +24,34 @@ const (
 	maxUDPPayload  = 64 * 1024
 )
 
+// hostResolver resolves a domain to its addresses using the DNS pipeline
+// (self zone, homelab remap, upstream). *Forwarder satisfies it.
+type hostResolver interface {
+	Resolve(name string) ([]netip.Addr, time.Duration, error)
+}
+
 // SubnetRouter forwards tailnet traffic routed to the advertised subnet. For
 // flows matching a port-mapping rule it hijacks the connection and relays it to
 // the rewritten destination; everything else in the subnet is handed to
 // gVisor's built-in userspace forwarder to reach its original destination.
 type SubnetRouter struct {
-	prefix netip.Prefix
-	rules  PortRules
-	cache  *ResolveCache
-	dialer net.Dialer
+	prefix   netip.Prefix
+	rules    PortRules
+	cache    *ResolveCache
+	resolver hostResolver
+	dialer   net.Dialer
 }
 
 // NewSubnetRouter returns a router for the advertised prefix. rules may be empty,
-// in which case the router only performs plain subnet forwarding.
-func NewSubnetRouter(prefix netip.Prefix, rules PortRules, cache *ResolveCache) *SubnetRouter {
+// in which case the router only performs plain subnet forwarding. resolver is
+// used to resolve domain rewrite targets through the homelab pipeline.
+func NewSubnetRouter(prefix netip.Prefix, rules PortRules, cache *ResolveCache, resolver hostResolver) *SubnetRouter {
 	return &SubnetRouter{
-		prefix: prefix,
-		rules:  rules,
-		cache:  cache,
-		dialer: net.Dialer{Timeout: dialTimeout},
+		prefix:   prefix,
+		rules:    rules,
+		cache:    cache,
+		resolver: resolver,
+		dialer:   net.Dialer{Timeout: dialTimeout},
 	}
 }
 
@@ -97,23 +106,38 @@ func (r *SubnetRouter) match(dst netip.AddrPort) (PortRule, bool) {
 	return r.rules.Match(dst, r.cache.Lookup)
 }
 
-// targetAddr renders a rule's rewritten destination as a host:port string,
-// resolving a domain target through the cache when possible so synthetic
-// homelab names still work; otherwise the OS resolver handles it at dial time.
-func (r *SubnetRouter) targetAddr(rule PortRule) string {
+// targetAddr renders a rule's rewritten destination as a host:port string. A
+// literal IP is used directly; a domain is resolved through the homelab
+// pipeline (self zone, remap, upstream) — falling back to the cache — so both
+// container names (web-caddy-1) and homelab names (caddy.web.homelab.ice) work.
+func (r *SubnetRouter) targetAddr(rule PortRule) (string, error) {
+	port := strconv.Itoa(int(rule.TargetPort))
 	host := rule.TargetHost
-	if _, err := netip.ParseAddr(host); err != nil {
-		if ips := r.cache.Lookup(host); len(ips) > 0 {
-			host = ips[0].String()
-		}
+
+	if _, err := netip.ParseAddr(host); err == nil {
+		return net.JoinHostPort(host, port), nil
 	}
-	return net.JoinHostPort(host, strconv.Itoa(int(rule.TargetPort)))
+	if ips := r.cache.Lookup(host); len(ips) > 0 {
+		return net.JoinHostPort(ips[0].String(), port), nil
+	}
+	ips, _, err := r.resolver.Resolve(host)
+	if err != nil {
+		return "", fmt.Errorf("resolve target %q: %w", host, err)
+	}
+	if len(ips) == 0 {
+		return "", fmt.Errorf("resolve target %q: no addresses", host)
+	}
+	return net.JoinHostPort(ips[0].String(), port), nil
 }
 
 func (r *SubnetRouter) hijackTCP(client net.Conn, rule PortRule) {
 	defer client.Close()
 
-	addr := r.targetAddr(rule)
+	addr, err := r.targetAddr(rule)
+	if err != nil {
+		log.Printf("port-map: %s: %v", rule.Source(), err)
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
 
@@ -129,7 +153,12 @@ func (r *SubnetRouter) hijackTCP(client net.Conn, rule PortRule) {
 }
 
 func (r *SubnetRouter) hijackUDP(client nettype.ConnPacketConn, rule PortRule) {
-	addr := r.targetAddr(rule)
+	addr, err := r.targetAddr(rule)
+	if err != nil {
+		log.Printf("port-map: %s: %v", rule.Source(), err)
+		_ = client.Close()
+		return
+	}
 
 	target, err := net.Dial("udp", addr)
 	if err != nil {

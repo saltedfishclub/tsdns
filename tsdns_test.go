@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net"
 	"net/netip"
 	"strings"
@@ -9,6 +10,11 @@ import (
 
 	"github.com/miekg/dns"
 )
+
+// resolverFunc adapts a function to the hostResolver interface for tests.
+type resolverFunc func(string) ([]netip.Addr, time.Duration, error)
+
+func (f resolverFunc) Resolve(name string) ([]netip.Addr, time.Duration, error) { return f(name) }
 
 func TestParsePortRules(t *testing.T) {
 	in := `
@@ -81,6 +87,35 @@ func TestPortRulesMatch(t *testing.T) {
 	}
 	if _, ok := rules.Match(netip.MustParseAddrPort("10.1.0.6:80"), lookup); ok {
 		t.Errorf("must not match an IP absent from the cache")
+	}
+}
+
+func TestTargetAddr(t *testing.T) {
+	cache := NewResolveCache()
+	resolver := resolverFunc(func(name string) ([]netip.Addr, time.Duration, error) {
+		if name == "web-caddy-1" {
+			return []netip.Addr{netip.MustParseAddr("10.1.0.3")}, time.Minute, nil
+		}
+		return nil, 0, fmt.Errorf("no such host %q", name)
+	})
+	r := NewSubnetRouter(netip.MustParsePrefix("10.1.0.0/27"), nil, cache, resolver)
+
+	// literal IP target: used verbatim, resolver untouched
+	if addr, err := r.targetAddr(PortRule{TargetHost: "10.0.0.9", TargetPort: 22}); err != nil || addr != "10.0.0.9:22" {
+		t.Fatalf("ip target = %q, err %v", addr, err)
+	}
+	// domain target resolved via the pipeline
+	if addr, err := r.targetAddr(PortRule{TargetHost: "web-caddy-1", TargetPort: 80}); err != nil || addr != "10.1.0.3:80" {
+		t.Fatalf("domain target = %q, err %v", addr, err)
+	}
+	// cache hit short-circuits the resolver
+	cache.Put("cached.example", []netip.Addr{netip.MustParseAddr("10.1.0.5")}, time.Minute)
+	if addr, err := r.targetAddr(PortRule{TargetHost: "cached.example", TargetPort: 443}); err != nil || addr != "10.1.0.5:443" {
+		t.Fatalf("cached target = %q, err %v", addr, err)
+	}
+	// unresolvable domain surfaces an error instead of dialing something wrong
+	if _, err := r.targetAddr(PortRule{TargetHost: "nope.invalid", TargetPort: 80}); err == nil {
+		t.Fatalf("expected error for unresolvable target")
 	}
 }
 

@@ -53,7 +53,7 @@ func main() {
 	// advertising the route, so hijack matching is ready when traffic arrives.
 	StartRuleResolver(forwarder, cache, rules)
 
-	if err := setupSubnetRouting(ctx, ts, cfg, rules, cache); err != nil {
+	if err := setupSubnetRouting(ctx, ts, cfg, rules, cache, forwarder); err != nil {
 		log.Fatalf("subnet routing: %v", err)
 	}
 
@@ -65,7 +65,7 @@ func main() {
 // setupSubnetRouting advertises the configured route and, when running in
 // userspace forwarding mode, installs the subnet router (which also applies
 // port-mapping hijack rules).
-func setupSubnetRouting(ctx context.Context, ts *tsnet.Server, cfg *Config, rules PortRules, cache *ResolveCache) error {
+func setupSubnetRouting(ctx context.Context, ts *tsnet.Server, cfg *Config, rules PortRules, cache *ResolveCache, forwarder *Forwarder) error {
 	if !cfg.AdvertiseRoute.IsValid() {
 		if len(rules) > 0 {
 			log.Print("warning: PORT_MAP_FILE set but ADVERTISE_ROUTE is empty; no traffic will be intercepted")
@@ -93,7 +93,7 @@ func setupSubnetRouting(ctx context.Context, ts *tsnet.Server, cfg *Config, rule
 	}
 	log.Println("no /dev/net/tun; using userspace L4 forwarding")
 
-	return NewSubnetRouter(cfg.AdvertiseRoute, rules, cache).Install(ts)
+	return NewSubnetRouter(cfg.AdvertiseRoute, rules, cache, forwarder).Install(ts)
 }
 
 func loadPortRules(cfg *Config) (PortRules, error) {

@@ -74,8 +74,8 @@ homelab.lan 2222 10.0.0.119 22
 # redirect a container's HTTP to an internal backend
 caddy.web.homelab.lan 80 10.1.0.9 8080
 
-# redirect a fixed subnet IP to another host:port
-10.1.0.3 443 secure.internal 8443
+# rewrite to a container by its homelab name (resolved via tsdns' remap)
+10.1.0.3 443 caddy.web.homelab.lan 80
 ```
 
 > The `<original-port>` is the port the client connects to, and `<original-dest>`
@@ -83,7 +83,9 @@ caddy.web.homelab.lan 80 10.1.0.9 8080
 > `ssh homelab.lan -p 2222`, the rule's original side must be `homelab.lan 2222`.
 
 `rewritten-dest` is dialed from tsdns: a literal IP is used directly, and a
-domain is resolved via the cache when known, otherwise by the host resolver.
+domain is resolved through the same pipeline tsdns serves to clients (self zone,
+homelab remap, upstream) — so both container names (`web-caddy-1`) and homelab
+names (`caddy.web.homelab.lan`) work as targets.
 
 > Port mapping is only active in userspace forwarding mode (i.e. when
 > `/dev/net/tun` is absent, as in the unprivileged container above), the same
